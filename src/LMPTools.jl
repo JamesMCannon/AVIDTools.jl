@@ -11,6 +11,7 @@ using HDF5, Dates
 using GeographicLib, SatelliteToolboxGeomagneticField
 using LongwaveModePropagator
 using VLF
+using ArchGDAL, Statistics
 
 project_path(parts...) = normpath(@__DIR__, "..", parts...)
 
@@ -75,6 +76,7 @@ export range
 export get_ground, get_groundcode, get_epsilon, get_sigma, groundsegments
 export igrf, chaos, load_CHAOS_matfile
 export zenithangle, isday, ferguson, flatlinearterminator, smoothterminator, fourierperturbation
+export gen_terminator_raster, get_subsolar_point, gcp_percent_day
 
 function __init__()
     cp = try
@@ -710,6 +712,296 @@ function fourierperturbation(sza, coeff; a=deg2rad(45)/2)
 end
 
 #Functions below added by AVID team, additional documentation needed 
+
+"""
+    get_sunrise_sunset(latitude, longitude, year, day_of_year, alt) -> (Float64,Float64)
+
+Return times of the next sunrise and sunset in seconds UTC for a provided position 
+    and date.
+
+# Arguments
+- Position is provided in `longitude`, `latitude` (decimal degrees), and 
+    `alt` (meters)
+- Time is provided in `year`, and `day_of_year` (1 is Jan 1)
+
+# Example
+```jldoctest
+julia> sunrise,sunset = PlotTerminator.get_sunrise_sunset(40.014984,-105.270546,2024,275,0)
+(46568.12530180309, 89095.38700982607)
+```
+"""
+function get_sunrise_sunset(latitude::Number,longitude::Number,year::Int,
+    day_of_year::Number,alt::Number)
+    if mod(year,4) == 0 && mod(year,100) != 0 #Looking for leap years
+        #fraction of year (radians), assume time is midnight UTC
+        frac_year = 2*pi/366 * (day_of_year-1)
+    else
+        frac_year = 2*pi/365 * (day_of_year-1)
+    end
+    #eqn of time (minutes)
+    eqtime = 229.18*(0.000075 + 0.001868*cos(frac_year) - 0.032077*sin(frac_year) - 
+        0.014615*cos(2*frac_year) - 0.040849*sin(2*frac_year))
+    #solar declination angle (radians)
+    decl = 0.006918-0.39912*cos(frac_year)+0.070257*sin(frac_year)-
+        0.006758*cos(2*frac_year)+0.000907*sin(2*frac_year)-
+        0.002697*cos(3*frac_year)+0.00148*sin(3*frac_year)
+    #hour angle (degrees)
+    ha = acosd((sind(-0.833-0.0347*sqrt(alt))/(cosd(latitude)*cos(decl)))-
+        tand(latitude)*tan(decl))
+    #Sunrise (seconds)
+    sunrise = (720 - 4*(longitude + ha) - eqtime)*60
+    #Sunset (seconds)
+    sunset = (720 - 4*(longitude - ha) - eqtime)*60
+    # Convert to Seconds since timing data is in seconds.
+    #If Sunset > 86400, that means local sunset is the next day in UTC
+    return sunrise,sunset
+end
+
+"""
+    gen_terminator_raster(degree_res,year::Int,day_of_year::Int; <keyword arguments>)
+"""
+function gen_terminator_raster(degree_res::Number,year::Int,day_of_year::Int;
+    alt::Number=100000,time_of_day::Number=0,
+    isFilled::Bool=true,exportMap::Bool=false,mapName::String="terminator")
+
+    resolution = 1/degree_res
+    long_mat = -180:degree_res:180
+    day_of_year = day_of_year + (time_of_day/86400)
+    
+    # Draw a straight line down the prime meridian
+    lat_mat = 90:(degree_res*-1):-90
+
+    llmat = zeros(length(lat_mat),length(long_mat))
+
+    pointsmat = zeros(2*length(lat_mat),2)
+
+    for i=axes(lat_mat,1)
+        # Try to get sunrise and sunset times for each point
+        time_tuple = try
+            get_sunrise_sunset(lat_mat[i],0,year,day_of_year,alt)
+        catch zeroOrTwoSunsets # If error, then point has either two or zero sunset points during the day. 
+            NaN # This error can be ignored, as these points lie outside of the terminator line.
+        end
+
+        sunrise_long = NaN
+        sunset_long = NaN
+
+        # Turn time into longitude coordinates
+        if !isnan(time_tuple[1])
+            sunrise_long = mod((((time_tuple[1]-43200)/86400) * 360),360) - 180
+            sunset_long = mod((((time_tuple[2]-43200)/86400) * 360),360) - 180
+        end
+
+        pointsmat[i,1] = lat_mat[i]
+        pointsmat[i,2] = sunrise_long
+
+        pointsmat[(i+length(lat_mat)),1] = lat_mat[i]
+        pointsmat[(i+length(lat_mat)),2] = sunset_long
+
+        # Represent coordinates in matrix
+        if !isnan(sunrise_long)
+            j_rise = round(Int,(sunrise_long+180)*resolution)+1
+            j_set = round(Int,(sunset_long+180)*resolution)+1
+            llmat[i,j_rise] = 1
+            llmat[i,j_set] = 1
+            
+            # Optionally fill in area where it is "daytime"
+            if isFilled == true
+                llmat[i,j_rise:length(long_mat)] = ones(1,length(j_rise:length(long_mat)))
+                llmat[i,1:j_set] = ones(1,length(1:j_set))
+            end
+        end
+
+        
+    end
+
+    pointsmat = sortslices(pointsmat, dims=1, lt=(x,y)->isless(x[2],y[2]))
+
+    points_longs = filter(!isnan,pointsmat[:,2])
+    new_pointsmat = zeros(length(points_longs),2)
+    new_pointsmat[:,2] = points_longs
+    new_pointsmat[:,1] = pointsmat[1:length(points_longs),1]
+    pointsmat = new_pointsmat
+
+    if isFilled == true
+        index = 1
+
+        while (iszero(llmat[index,:]))
+            llmat[index,:] = ones(length(long_mat))
+            index += 1
+        end
+    end
+
+    if time_of_day != 0
+        degree_shift = mod((((time_of_day)/86400) * 360),360) - 180
+        j_shift = round(Int,(degree_shift+180)*resolution)+1
+        right_end = length(long_mat)
+        
+        llmat_shifted = zeros(length(lat_mat),length(long_mat))
+        llmat_shifted[:,1:(right_end - j_shift + 1)] = llmat[:,j_shift:right_end]
+        llmat_shifted[:,(right_end - j_shift + 2):right_end] = llmat[:,1:(j_shift - 1)]
+        llmat = llmat_shifted
+
+        points_shift = - mod((((time_of_day+43200)/86400) * 360),360) + 180
+        @. pointsmat[:,2] = mod(pointsmat[:,2] + points_shift + 180,360) - 180
+        pointsmat = sortslices(pointsmat, dims=1, lt=(x,y)->isless(x[2],y[2]))
+    end
+
+    if exportMap == true
+        AG = ArchGDAL
+        datadir = normpath(@__DIR__,"..", "raster_data") # Folder "raster_data" needs to be added in order to export GeoTIFFs
+        
+        proj = AG.toWKT(AG.importPROJ4("+proj=longlat +datum=WGS84 +no_defs"))
+        transform = [-180.0, degree_res, 0, 90.0, 0, -1*degree_res]
+
+        llmat_map = convert(Array{Float32},transpose(llmat))
+
+        AG.create(
+		normpath(datadir, mapName * ".tif"),
+		driver = AG.getdriver("GTiff"),
+		width = size(llmat_map,1),
+		height = size(llmat_map,2),
+		nbands = 1,
+		dtype=Float32,
+	) do dataset
+		AG.write!(dataset, llmat_map, 1)
+
+		AG.setgeotransform!(dataset, transform)
+		AG.setproj!(dataset, proj)
+	    end
+        
+    end
+
+    return llmat,pointsmat
+end
+
+"""
+    gen_terminator_raster(degree_res,datetime::DateTime; <keyword arguments>)
+
+Generate a matrix which depicts the ionospheric terminator at a provided resolution 
+    (`degree_res` in degrees per pixel), and date UTC. 
+    
+# Outputs
+- A matrix that depicts the terminator. A value of `1` is day, and `0` is night.
+- A matrix that contains all computed latitudes and longitudes of the computed
+terminator line
+
+# Arguments
+- `alt::Number=100000`: the height at which the terminator is computed (meters).
+- `time_of_day::Number=0`: only when using `year` and `day_of_year` (1 being Jan 1). 
+Time of day in seconds UTC at which to compute the terminator.
+- `exportMap::Bool=false`: whether or not to export a GeoTIFF map of the
+computed terminator.
+- `isFilled::Bool=true`: whether or not to make all night values in the matrix `0`. 
+A value of `true` would only make the terminator `0`.
+- `mapName::String="terminator"`: if exporting the matrix as a GeoTIFF raster,
+this would be the name of the image.
+
+# Example
+```jldoctest
+
+```
+"""
+function gen_terminator_raster(degree_res::Number,datetime::DateTime;
+    alt::Number=100000,
+    isFilled::Bool=false,exportMap::Bool=false,mapName="terminator")
+    # Generates a raster which depicts the terminator. Utilizes the DateTime() type, with time assumed to be in UTC
+    year = Dates.year(datetime)
+    day_of_year = Dates.dayofyear(datetime)
+    time_of_day = (Dates.hour(datetime)*3600) + (Dates.minute(datetime)*60) + 
+        Dates.second(datetime)
+
+    (llmat,pointsmat) = gen_terminator_raster(degree_res,year,day_of_year,
+    alt=alt,time_of_day=time_of_day,
+    isFilled=isFilled,exportMap=exportMap,mapName=mapName)
+
+    return llmat,pointsmat
+
+end
+
+function get_subsolar_point(year::Int,day_of_year::Int,time_of_day::Number)
+    # Generates the coordinates of the subsolar point at a given date and time
+    if mod(year,4) == 0 && mod(year,100) != 0 #Looking for leap years
+        #fraction of year (radians)
+        frac_year = 2*pi/366 * (day_of_year-1/2)
+    else
+        frac_year = 2*pi/365 * (day_of_year-1/2)
+    end
+    #eqn of time (minutes)
+    eqtime = 229.18*(0.000075 + 0.001868*cos(frac_year) - 0.032077*sin(frac_year) - 
+        0.014615*cos(2*frac_year) - 0.040849*sin(2*frac_year))
+    #solar declination angle(radians)
+    decl = 0.006918-0.39912*cos(frac_year)+0.070257*sin(frac_year)-
+        0.006758*cos(2*frac_year)+0.000907*sin(2*frac_year)-0.002697*cos(3*frac_year)+
+        0.00148*sin(3*frac_year)
+    
+    subsolar_lat = decl*(360/2pi)
+    subsolar_long = -15*((time_of_day/3600)-12+(eqtime/60))
+
+    return subsolar_lat,subsolar_long
+end
+
+function get_subsolar_point(datetime::DateTime)
+    # Generates a raster which depicts the terminator. Utilizes the DateTime() type, with time assumed to be in UTC
+    year = Dates.year(datetime)
+    day_of_year = Dates.dayofyear(datetime)
+    time_of_day = (Dates.hour(datetime)*3600) + (Dates.minute(datetime)*60) + 
+        Dates.second(datetime)
+
+    (subsolar_lat,subsolar_long) = get_subsolar_point(year,day_of_year,time_of_day)
+
+    return subsolar_lat,subsolar_long
+
+end
+
+function is_day(lat,long,datetime::DateTime;alt=60e3)
+    # Returns a bool indicating if the provided point in space and time is in day or night
+    year = Dates.year(datetime)
+    day_of_year = Dates.dayofyear(datetime)
+    time_of_day = (Dates.hour(datetime)*3600) + (Dates.minute(datetime)*60) + 
+        Dates.second(datetime)
+
+    # Get sunrise and sunset times
+    (sunrise,sunset) = try get_sunrise_sunset(lat,long,year,day_of_year,alt)
+        catch whoops
+            if lat > 0
+                return true
+            else
+                return false
+            end
+        end
+
+    if time_of_day > sunrise && time_of_day < sunset
+        return true
+    else
+        return false
+    end
+end
+
+function gcp_percent_day(start_lat,start_long,end_lat,end_long,datetime;
+    resolution=20e3,alt=60e3)
+    # Using provided start and end coordinates, returns the percentage of the Great Circle path within the terminator 
+
+    line = GeodesicLine(start_long,start_lat,lon2=end_long,lat2=end_lat)
+    pts = waypoints(line, dist=resolution)
+    gcp_bool = zeros(length(pts))
+    index = 1
+
+    # check each point along the path to see if it is during the day
+    for pt in pts
+        lat, lon = pt.lat, pt.lon
+        gcp_bool[index] = is_day(lat,lon,datetime,alt=alt)
+        index += 1
+    end
+    
+    # take an average
+    GCP_percent_day = mean(gcp_bool)
+
+    # return the GCP itself
+
+    return GCP_percent_day,gcp_bool
+end
+
 function readSims(h,beta,filebase)
     pha= fill(NaN, size(beta,1), size(h,1)) #h, Beta, amp, pha
     amp= fill(NaN, size(beta,1), size(h,1)) #h, Beta, amp, pha
