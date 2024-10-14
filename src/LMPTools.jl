@@ -1,7 +1,7 @@
 """
-    LMPTools
+    AVIDTools
 
-Convenience and utility functions for LongwaveModePropagator.jl.
+Convenience and utility functions for LongwaveModePropagator.jl interacting with the AVID network of VLF receivers.
 """
 module LMPTools
 
@@ -10,23 +10,67 @@ using Rotations, StaticArrays
 using HDF5, Dates
 using GeographicLib, SatelliteToolboxGeomagneticField
 using LongwaveModePropagator
+using VLF
 
 project_path(parts...) = normpath(@__DIR__, "..", parts...)
 
 const GROUND_DATA = h5read(project_path("data", "conductivity_data.h5"), "/")
 
 const TRANSMITTER = Dict(
-    :NAA => Transmitter("NAA", 44.646394, -67.281069, 24e3),
-    :NAU => Transmitter("NAU", 18.39875, -67.177433, 40.75e3),
-    :NML => Transmitter("NML", 46.366014, -98.335544, 25.2e3),
-    :NLK => Transmitter("NLK", 48.203611, -121.917056, 24.8e3),
-    :NPM => Transmitter("NPM", 21.420, -158.151, 21.4e3)
+    :NAA => Transmitter{VerticalDipole}("NAA", 44.646394, -67.281069, VerticalDipole(), Frequency(24e3), 1e6),
+    :NAU => Transmitter{VerticalDipole}("NAU", 18.39875, -67.177433, VerticalDipole(), Frequency(40.75e3), 1e5),
+    :NML => Transmitter{VerticalDipole}("NML", 46.366014, -98.335544, VerticalDipole(), Frequency(25.2e3), 233000),
+    :NLK => Transmitter{VerticalDipole}("NLK", 48.203611, -121.917056, VerticalDipole(), Frequency(24.8e3), 142.77e3), #ARL measurement comparisons with LMP suggest 142.77. Uncertaintity from 2 std of ARL measurments is 2.8% or 3.49e3 W. FWM dictionary of transmitter powers suggests 250e3. Quick look at CAL data supports this power - deeper dive needed both here and NPM
+    :NPM => Transmitter{VerticalDipole}("NPM", 21.420, -158.151, VerticalDipole(), Frequency(21.4e3), 424000)
 )
+
+const RECEIVER = Dict(#make consistent precision in lat/long
+    :ARL => Receiver("ARL", 48.16630, -122.11487, 0.0, VerticalDipole()),
+    :CAL => Receiver("CAL", 51.653775, -128.13274, 0.0, VerticalDipole()),
+    :PRU => Receiver("PRU", 54.31045, -130.32571, 0.0, VerticalDipole()),
+    :JU => Receiver("JU", 58.59062, -134.904145833, 0.0, VerticalDipole()),
+    :WHI => Receiver("WHI", 60.75127, -135.10105, 0.0, VerticalDipole()),
+    :FSI => Receiver("FSI", 61.756622, -121.22904, 0.0, VerticalDipole()),
+    :FSM => Receiver("FSM", 60.02608, -111.93164, 0.0, VerticalDipole()),
+    :RAB => Receiver("RAB", 58.2197, -103.6964, 0.0, VerticalDipole()), #UPDATE after deployment
+    :CH => Receiver("CH", 58.7686, -94.1725, 0.0, VerticalDipole()), #UPDATE after looking at data
+    :GIL => Receiver("GIL", 56.377043, -94.64403, 0.0, VerticalDipole()),
+    :ISL => Receiver("ISL", 53.85517, -94.65967, 0.0, VerticalDipole()),
+    :PIN => Receiver("PIN", 50.25812, -95.86516, 0.0, VerticalDipole()),
+    :LAM => Receiver("LAM", 46.3522, -98.2919, 0.0, VerticalDipole()) #UPDATE after deployment
+)
+
+#structures useful for saving LMP outputs to be used in estimations
+struct SimulationMultipleSample
+    h_prime::Float64
+    beta::Float64
+    E::Vector{Complex{Float64}}
+    amp::Vector{Float64}
+    pha::Vector{Float64}
+end
+
+struct SimulationSingleSample
+    h_prime::Float64
+    beta::Float64
+    E::Complex{Float64}
+    amp::Float64
+    pha::Float64
+end
+
+struct SimulationInputs
+    dists::Vector{Float64}
+    grnds::Vector{Ground}
+    mags::Vector{BField}
+    tx::Transmitter
+    rx::Receiver
+    params::LMPParams
+end
 
 const CHAOS = PyNULL()
 const CHAOS_MODEL = PyNULL()
 
 export TRANSMITTER
+export RECEIVER
 export range
 export get_ground, get_groundcode, get_epsilon, get_sigma, groundsegments
 export igrf, chaos, load_CHAOS_matfile
@@ -661,6 +705,214 @@ function fourierperturbation(sza, coeff; a=deg2rad(45)/2)
         coeff[5]*sinpi(sza*2/a)
     
     return pert
+end
+
+#Functions below added by AVID team, additional documentation needed 
+function readSims(h,beta,filebase)
+    pha= fill(NaN, size(beta,1), size(h,1)) #h, Beta, amp, pha
+    amp= fill(NaN, size(beta,1), size(h,1)) #h, Beta, amp, pha
+    
+    for b in eachindex(beta)
+        x = beta[b]
+        temp=load(filebase*"$x.jld2","sorted")
+        for i in eachindex(temp)
+            pha[b,i] = temp[i].pha
+            amp[b,i] = temp[i].amp
+        end
+    end
+    return amp,pha
+end
+
+function circle_distance_deg(a,b)
+    diff1 = abs(a-b)
+    if a > 0
+        diff2=abs((a-360)-b)
+    elseif a<0
+        diff2=abs((a+360-b))
+    else
+        diff2=diff1
+    end
+    
+    if diff1<diff2
+        return diff1
+    else
+        return diff2
+    end
+end
+
+function ununwrapPhase(elem)
+    if elem>180
+        elem=ununwrapPhase(elem-360)
+    elseif elem<-180
+        elem=ununwrapPhase(elem+360)
+    end
+    return elem
+end
+#TODO refactor to while loops^&v
+function recursive_dists_segmentation(current,next,max_diff,curr_gnd,next_gnd)
+    diff_x = next-current
+    if diff_x>max_diff
+        dists,associated_gnds=recursive_dists_segmentation(current+max_diff,next,max_diff,curr_gnd,next_gnd)
+        list = vcat(current,dists)
+        gnds = vcat(curr_gnd,associated_gnds)
+    else
+        list = vcat(current,next)
+        gnds = vcat(curr_gnd,next_gnd)
+    end
+    return list, gnds
+end
+
+
+function WGSegmentation(tx,rx;x_res=20e3,dec_year=2024,gs_res=50e3,max_WG_length=400e3)
+    first_gnds, first_dists = groundsegments(tx,rx,resolution=x_res,require_permittivity_change=false)
+    max_dist=range(tx,rx)
+
+    append!(first_dists,max_dist)
+    append!(first_gnds,first_gnds[[end]])
+
+    max_idx = length(first_dists)
+    dists=[]
+    gnds=[]
+    
+    for i in 1:1:max_idx-1
+        d, g = recursive_dists_segmentation(first_dists[i],first_dists[i+1],max_WG_length,first_gnds[i],first_gnds[i+1])
+        if i > 1
+            if dists[end]==d[1]
+                    append!(dists,d[2:end])
+                    append!(gnds,g[2:end])
+            else
+                    append!(dists,d)
+                    append!(gnds,g)
+            end
+        else
+            append!(dists,d)
+            append!(gnds,g)
+        end
+    end
+
+    pop!(dists)
+    pop!(gnds)
+    mag = igrf(tx,rx,dec_year,dists)
+    num_segments = length(dists)
+
+    sample_dists = collect(0:gs_res:max_dist)
+    push!(sample_dists,max_dist)
+
+    gs = GroundSampler(sample_dists,Fields.Ez)
+
+    return num_segments, dists, gnds, mag, gs
+end
+
+function getVLFdata(folder_path,Transmitter_code,date,cal_file;unwrap_phase=true,legacy_flag)
+
+    if legacy_flag
+        EW = "_100"
+        NS = "_101"
+    else
+        EW = "_EW_"
+        NS = "_NS_"
+    end
+
+    date_str = Dates.format(Date(date),"yymmdd")
+
+    EW_pha_in_pat = Regex(join([date_str,".*",Transmitter_code*EW*"B"]))
+    EW_pha_days = read_data(read_multiple_mat_files(folder_path,EW_pha_in_pat))
+
+    NS_pha_in_pat = Regex(join([date_str,".*",Transmitter_code*NS*"B"]))
+    NS_pha_days = read_data(read_multiple_mat_files(folder_path,NS_pha_in_pat))
+
+    EW_amp_in_pat = Regex(join([date_str,".*",Transmitter_code*EW*"A"]))
+    EW_amp_days = calibrate_NB(read_data(read_multiple_mat_files(folder_path,EW_amp_in_pat)),cal_file=cal_file)
+
+    NS_amp_in_pat = Regex(join([date_str,".*",Transmitter_code*NS*"A"]))
+    NS_amp_days = calibrate_NB(read_data(read_multiple_mat_files(folder_path,NS_amp_in_pat)),cal_file=cal_file)
+
+    amp_Combined_Data = combine_2ch(NS_amp_days,EW_amp_days)
+
+    NS_stitched_phase = stitchPhase(NS_pha_days,unwrap=unwrap_phase)
+    EW_stitched_phase = stitchPhase(EW_pha_days,unwrap=unwrap_phase)
+
+    return amp_Combined_Data, NS_stitched_phase, EW_stitched_phase
+end
+
+function getVLFdata(folder_path,Transmitter_code,date,cal_file;unwrap_phase=true,Phase_Baseline_Path=nothing,tolerance=10,legacy_flag=false)
+
+    if legacy_flag
+        EW = "_100"
+        NS = "_101"
+    else
+        EW = "_EW_"
+        NS = "_NS_"
+    end
+
+    if isnothing(Phase_Baseline_Path)
+        if Transmitter_code == "NLK"
+            Phase_Baseline_Path = "L:\\VLF\\AVID\\ARL\\Narrowband\\"
+        elseif Transmitter_code == "NML"
+            Phase_Baseline_Path = "L:\\VLF\\AVID\\LAM\\Narrowband\\"
+        else
+            error("Unknown transmitter, ",Transmitter_code)
+        end
+        year = Dates.format(Date(date),"yyyy")
+        month = Dates.format(Date(date),"mm") *"_"* Dates.monthname(Date(date))
+        Phase_Baseline_Path = Phase_Baseline_Path*year*"\\"*month*"\\"
+    end
+
+    date_str = Dates.format(Date(date),"yymmdd")
+
+    EW_pha_in_pat = Regex(join([date_str,".*",Transmitter_code*EW*"B"]))
+    EW_pha_days = read_data(read_multiple_mat_files(folder_path,EW_pha_in_pat))
+
+    NS_pha_in_pat = Regex(join([date_str,".*",Transmitter_code*NS*"B"]))
+    NS_pha_days = read_data(read_multiple_mat_files(folder_path,NS_pha_in_pat))
+
+    EW_amp_in_pat = Regex(join([date_str,".*",Transmitter_code*EW*"A"]))
+    EW_amp_days = calibrate_NB(read_data(read_multiple_mat_files(folder_path,EW_amp_in_pat)),cal_file=cal_file)
+
+    NS_amp_in_pat = Regex(join([date_str,".*",Transmitter_code*NS*"A"]))
+    NS_amp_days = calibrate_NB(read_data(read_multiple_mat_files(folder_path,NS_amp_in_pat)),cal_file=cal_file)
+
+    amp_Combined_Data = combine_2ch(NS_amp_days,EW_amp_days)
+
+    NS_clean_pha = VLF.clean_phase.(Phase_Baseline_Path,Transmitter_code,NS_pha_days)
+    EW_clean_pha = VLF.clean_phase.(Phase_Baseline_Path,Transmitter_code,EW_pha_days)
+
+    NS_stitched_phase = stitchPhase(NS_clean_pha,unwrap=unwrap_phase,tolerance=tolerance)
+    EW_stitched_phase = stitchPhase(EW_clean_pha,unwrap=unwrap_phase,tolerance=tolerance)
+
+    return amp_Combined_Data, NS_stitched_phase, EW_stitched_phase
+end
+
+
+function fromdB(dbuV)
+    uV = 10 ^(dbuV/20) #uV/m
+    V = uV*(10^-6)   #V/m
+    return V
+end
+
+function todB(V)
+    uV = V*10^6 #uV/m
+    dbuV = 20*log10(uV) #dBuV/m
+    return dbuV
+end
+
+function plotphamap(h,beta,sim_pha,rx,)
+    figure()
+    phamap=heatmap(h,beta,sim_pha,xlabel="h'",ylabel="\$\\beta\$",title="NLK phase at "*rx.name,color =cgrad(:viridis),clims=(-180,180),colorbar_title="Phase (\$ \\degree \$)",dpi=400)
+    show()
+    Plots.savefig(phamap,rx.name*"_PhaMap.png")
+end
+
+function plotampmap(h,beta,sim_amp,tv,rx;secondary_title="")
+    figure()
+    mi = minimum(tv)
+    ma = maximum(tv)
+    clims = (mi, ma)
+    tl = ["$v" for v in tv]
+    ampmap=heatmap(h,beta,(sim_amp),color =cgrad(:viridis),colorbar_ticks=(tv,tl),clims=clims,xlabel="h'",ylabel="\$\\beta\$",title="NLK amplitude at "*rx.name*secondary_title,colorbar_title="dB (uV/m)",dpi=400)
+    show()
+    
+    Plots.savefig(ampmap,rx.name*"_AmpMap"*secondary_title*".png")
 end
 
 end  # module
