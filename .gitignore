@@ -26,3 +26,6 @@ docs/site/
 *.pdf
 *.png
 *.csv
+
+# Directory for raster data to be used by other programs
+raster_data/
