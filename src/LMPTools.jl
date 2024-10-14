@@ -146,7 +146,7 @@ end
 
 Load CHAOS model `version`.
 
-Only versions `v7.8` through `v7.11` are provided with this package. Users can download
+Only versions `v7.8` through `v7.11` and `v7.18` are provided with this package. Users can download
 other versions from https://www.spacecenter.dk/files/magnetic-models/CHAOS-7/ onto their
 local machine and specify the file path to this function instead.
 
@@ -164,6 +164,8 @@ function load_CHAOS_matfile(version::VersionNumber)
         load_CHAOS_matfile(joinpath(project_path("data"), "CHAOS-7.10.mat"))
     elseif version == v"7.11"
         load_CHAOS_matfile(joinpath(project_path("data"), "CHAOS-7.11.mat"))
+    elseif version == v"7.18"
+        load_CHAOS_matfile(joinpath(project_path("data"), "CHAOS-7.18.mat"))
     else
         @warn "CHAOS $version not found. Model coefficients can be found here: https://www.spacecenter.dk/files/magnetic-models/CHAOS-7/"
     end
