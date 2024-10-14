@@ -761,7 +761,7 @@ end
     gen_terminator_raster(degree_res,year::Int,day_of_year::Int; <keyword arguments>)
 """
 function gen_terminator_raster(degree_res::Number,year::Int,day_of_year::Int;
-    alt::Number=100000,time_of_day::Number=0,
+    alt::Number=60e3,time_of_day::Number=0,
     isFilled::Bool=true,exportMap::Bool=false,mapName::String="terminator")
 
     resolution = 1/degree_res
@@ -887,7 +887,7 @@ Generate a matrix which depicts the ionospheric terminator at a provided resolut
 terminator line
 
 # Arguments
-- `alt::Number=100000`: the height at which the terminator is computed (meters).
+- `alt::Number=60e3`: the height at which the terminator is computed (meters).
 - `time_of_day::Number=0`: only when using `year` and `day_of_year` (1 being Jan 1). 
 Time of day in seconds UTC at which to compute the terminator.
 - `exportMap::Bool=false`: whether or not to export a GeoTIFF map of the
@@ -903,7 +903,7 @@ this would be the name of the image.
 ```
 """
 function gen_terminator_raster(degree_res::Number,datetime::DateTime;
-    alt::Number=100000,
+    alt::Number=60e3,
     isFilled::Bool=false,exportMap::Bool=false,mapName="terminator")
     # Generates a raster which depicts the terminator. Utilizes the DateTime() type, with time assumed to be in UTC
     year = Dates.year(datetime)
