@@ -726,7 +726,7 @@ Return times of the next sunrise and sunset in seconds UTC for a provided positi
 
 # Example
 ```jldoctest
-julia> sunrise,sunset = PlotTerminator.get_sunrise_sunset(40.014984,-105.270546,2024,275,0)
+julia> sunrise,sunset = get_sunrise_sunset(40.014984,-105.270546,2024,275,0)
 (46568.12530180309, 89095.38700982607)
 ```
 """
@@ -824,12 +824,25 @@ function gen_terminator_raster(degree_res::Number,year::Int,day_of_year::Int;
     pointsmat = new_pointsmat
 
     if isFilled == true
-        index = 1
-
-        while (iszero(llmat[index,:]))
-            llmat[index,:] = ones(length(long_mat))
-            index += 1
+        # Fills the top and bottom sections of the map accordingly
+        topIndex = 1
+        while (iszero(llmat[topIndex,:]))
+            topIndex += 1
         end
+
+        if mean(llmat[topIndex,:]) >= mean(llmat[topIndex+1,:])
+            llmat[1:topIndex-1,:] = ones(1:topIndex-1,length(long_mat));
+        end
+
+        bottomIndex = length(llmat[:,1])
+        while (iszero(llmat[bottomIndex,:]))
+            bottomIndex -= 1
+        end
+
+        if mean(llmat[bottomIndex,:]) >= mean(llmat[bottomIndex-1,:])
+            llmat[bottomIndex+1:length(llmat[:,1]),:] = ones(bottomIndex+1:length(llmat[:,1]),length(long_mat))
+        end
+
     end
 
     if time_of_day != 0
@@ -879,7 +892,7 @@ end
     gen_terminator_raster(degree_res,datetime::DateTime; <keyword arguments>)
 
 Generate a matrix which depicts the ionospheric terminator at a provided resolution 
-    (`degree_res` in degrees per pixel), and date UTC. 
+    (`degree_res` in degrees per pixel), and datetime UTC. 
     
 # Outputs
 - A matrix that depicts the terminator. A value of `1` is day, and `0` is night.
@@ -956,6 +969,7 @@ end
 
 function is_day(lat,long,datetime::DateTime;alt=60e3)
     # Returns a bool indicating if the provided point in space and time is in day or night
+    # Will return nothing near the poles, at a latitude of roughly ±65 for alt=60e3
     year = Dates.year(datetime)
     day_of_year = Dates.dayofyear(datetime)
     time_of_day = (Dates.hour(datetime)*3600) + (Dates.minute(datetime)*60) + 
@@ -964,11 +978,8 @@ function is_day(lat,long,datetime::DateTime;alt=60e3)
     # Get sunrise and sunset times
     (sunrise,sunset) = try get_sunrise_sunset(lat,long,year,day_of_year,alt)
         catch whoops
-            if lat > 0
-                return true
-            else
-                return false
-            end
+            # Sun either does not rise or set during this day, at this location
+            return
         end
 
     if time_of_day > sunrise && time_of_day < sunset
